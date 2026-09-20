@@ -18,6 +18,8 @@ import traceback
 import uuid
 import asyncio
 import sys
+import warnings
+import logging
 
 
 asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -26,9 +28,9 @@ from state import *
 from prompts import ADVISORY_PROMPT , INTENT_ROUTER_PROMPT , LTM_WRITE_PROMPT
 
 
-import warnings
 
 warnings.filterwarnings("ignore", category=UserWarning, module="langchain_nvidia_ai_endpoints")
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -95,9 +97,45 @@ async def intent_router_node(state : AgriAdvisoryState) -> dict:
 
 
 
-async def ltm_write(state : AgriAdvisoryState , store : BaseStore) -> dict:
-    print('From the ltm write node')
+# async def ltm_write(state : AgriAdvisoryState , store : BaseStore) -> dict:
+    
 
+#     namespace = ('farmer_profile' , state.farmer_id , 'profile')
+#     items = await store.asearch(namespace)
+    
+#     # Convert memory item into string blob for (user_details_content)
+#     # Keeps it dead simple for teaching
+#     if items:
+#         user_details_content = '\n'.join(f"-{it.value.get('data' , '')}" for it in items)
+
+#     else:
+#         user_details_content = '' # prompts says it may be empty
+
+#     ltm_write_llm = ChatNVIDIA(model="nvidia/nemotron-3.5-lightning-30b-a3b")
+#     ltm_write_structure_llm = ltm_write_llm.bind_tools([MemoryDecision], tool_choice="MemoryDecision")
+
+
+#     response = await ltm_write_structure_llm.ainvoke([
+#         SystemMessage(content = LTM_WRITE_PROMPT.format(existing_memories=user_details_content)),
+#         HumanMessage(content= f'Query : {state.raw_query} \n Response : {state.final_response}'),
+#     ])
+
+#     args = response.tool_calls[0]["args"]
+#     decision = MemoryDecision(**args)
+
+#     if decision.should_write:
+#         for memory in decision.memories:
+#             if memory.is_new:
+#                 await store.aput(namespace, str(uuid.uuid4()), {'data': memory.text})
+
+
+#     return {'llm_used' : state.llm_used+1}
+
+
+async def ltm_write(state : AgriAdvisoryState , store : BaseStore) -> dict:
+
+    print('From the ltm write node')
+    
     '''Extract atomic, de-duplicated facts from the turn and persist new ones.
 
     Args:
@@ -110,35 +148,34 @@ async def ltm_write(state : AgriAdvisoryState , store : BaseStore) -> dict:
         dict: Always an empty dict — this node mutates long-term memory
             directly via `store.aput` rather than the graph state.
     '''
-
-    namespace = ('farmer_profile' , state.farmer_id , 'profile')
-    items = await store.asearch(namespace)
     
-    # Convert memory item into string blob for (user_details_content)
-    # Keeps it dead simple for teaching
-    if items:
-        user_details_content = '\n'.join(f"-{it.value.get('data' , '')}" for it in items)
+    asyncio.create_task(_write_ltm_background(state, store))
+    return {'llm_used': state.llm_used + 1}
 
-    else:
-        user_details_content = '' # prompts says it may be empty
+async def _write_ltm_background(state, store):
+    namespace = ('farmer_profile', state.farmer_id, 'profile')
+    items = await store.asearch(namespace)
+    user_details_content = '\n'.join(f"-{it.value.get('data', '')}" for it in items) or "No memories on file yet."
 
-    ltm_write_llm = ChatNVIDIA(model="deepseek-ai/deepseek-v4-pro-0813")
+    ltm_write_llm = ChatNVIDIA(model="nvidia/nemotron-3.5-lightning-30b-a3b" , max_completion_tokens=8000)
+    ltm_write_structure_llm = ltm_write_llm.bind_tools([MemoryDecision], tool_choice="MemoryDecision")
+    
+    try:
+        response = await ltm_write_structure_llm.ainvoke([
+            SystemMessage(content=LTM_WRITE_PROMPT.format(existing_memories=user_details_content)),
+            HumanMessage(content=f"Query: {state.raw_query}\nResponse: {state.final_response}"),
+        ])
 
-    structured_llm = ltm_write_llm.with_structured_output(MemoryDecision, method="function_calling")
-
-
-    decision: MemoryDecision = await structured_llm.ainvoke([
-        SystemMessage(content = LTM_WRITE_PROMPT.format(existing_memories=user_details_content)),
-        HumanMessage(content= f'Query : {state.raw_query} \n Response : {state.final_response}')
-    ])
-
-    if decision.should_write:
-        for memory in decision.memories:
-            if memory.is_new:
-                await store.aput(namespace, str(uuid.uuid4()), {'data': memory.text})
+        args = response.tool_calls[0]["args"]
+        decision = MemoryDecision(**args)
 
 
-    return {'llm_used' : state.llm_used+1}
+        if decision.should_write:
+            for memory in decision.memories:
+                if memory.is_new:
+                    await store.aput(namespace, str(uuid.uuid4()), {'data': memory.text})
+    except Exception as e:
+        logger.warning(f"LTM write failed for farmer {state.farmer_id}: {e}")
 
 
 async def context_node(state : AgriAdvisoryState , store : BaseStore) -> dict:
