@@ -53,7 +53,7 @@ mandi_server_params = StdioServerParameters(
     args=[MANDI_SERVER_SCRIPT],
 )
 
-llm = ChatNVIDIA(model = 'nvidia/nemotron-3.5-lightning-30b-a3b')
+llm = ChatNVIDIA(model = 'nvidia/nemotron-3-super-120b-a12b')
 
 
 
@@ -158,16 +158,16 @@ async def _write_ltm_background(state, store):
     user_details_content = '\n'.join(f"-{it.value.get('data', '')}" for it in items) or "No memories on file yet."
 
     ltm_write_llm = ChatNVIDIA(model="nvidia/nemotron-3.5-lightning-30b-a3b" , max_completion_tokens=8000)
-    ltm_write_structure_llm = ltm_write_llm.bind_tools([MemoryDecision], tool_choice="MemoryDecision")
+    ltm_write_structure_llm = ltm_write_llm.with_structured_output(MemoryDecision)
     
     try:
-        response = await ltm_write_structure_llm.ainvoke([
+        decision = await ltm_write_structure_llm.ainvoke([
             SystemMessage(content=LTM_WRITE_PROMPT.format(existing_memories=user_details_content)),
             HumanMessage(content=f"Query: {state.raw_query}\nResponse: {state.final_response}"),
         ])
 
-        args = response.tool_calls[0]["args"]
-        decision = MemoryDecision(**args)
+        # args = response.tool_calls[0]["args"]
+        # decision = MemoryDecision(**args)
 
 
         if decision.should_write:
@@ -306,12 +306,12 @@ async def mandi_price_mcp_server(state : AgriAdvisoryState) -> dict:
             - mandi_tool_error (str): On failure or missing crop/district.
     '''
 
-    commodity = state.farmer_profile.current_crop if state.farmer_profile.current_crop else None
-    state_name = state.farmer_profile.location.get('state_name') if state.farmer_profile.location.get('state_name') else None
-    market = state.farmer_profile.location.get('market') if state.farmer_profile.location.get('market') else None
-    variety = state.farmer_profile.variety if state.farmer_profile.variety else None
-    grade = state.farmer_profile.grade if state.farmer_profile.grade else None
-    district = state.farmer_profile.location.get('district') if state.farmer_profile.location.get('district') else None
+    commodity = state.farmer_profile.current_crop if state.farmer_profile else None
+    state_name = state.farmer_profile.location.get('state_name') if state.farmer_profile else None
+    market = state.farmer_profile.location.get('market') if state.farmer_profile else None
+    variety = state.farmer_profile.variety if state.farmer_profile else None
+    grade = state.farmer_profile.grade if state.farmer_profile else None
+    district = state.farmer_profile.location.get('district') if state.farmer_profile else None
 
     if not state_name or not district or not market or not commodity or not variety or not grade:
         return {'mandi_tool_error' : 'Missing parameter'}
