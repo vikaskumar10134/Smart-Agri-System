@@ -97,39 +97,6 @@ async def intent_router_node(state : AgriAdvisoryState) -> dict:
 
 
 
-# async def ltm_write(state : AgriAdvisoryState , store : BaseStore) -> dict:
-    
-
-#     namespace = ('farmer_profile' , state.farmer_id , 'profile')
-#     items = await store.asearch(namespace)
-    
-#     # Convert memory item into string blob for (user_details_content)
-#     # Keeps it dead simple for teaching
-#     if items:
-#         user_details_content = '\n'.join(f"-{it.value.get('data' , '')}" for it in items)
-
-#     else:
-#         user_details_content = '' # prompts says it may be empty
-
-#     ltm_write_llm = ChatNVIDIA(model="nvidia/nemotron-3.5-lightning-30b-a3b")
-#     ltm_write_structure_llm = ltm_write_llm.bind_tools([MemoryDecision], tool_choice="MemoryDecision")
-
-
-#     response = await ltm_write_structure_llm.ainvoke([
-#         SystemMessage(content = LTM_WRITE_PROMPT.format(existing_memories=user_details_content)),
-#         HumanMessage(content= f'Query : {state.raw_query} \n Response : {state.final_response}'),
-#     ])
-
-#     args = response.tool_calls[0]["args"]
-#     decision = MemoryDecision(**args)
-
-#     if decision.should_write:
-#         for memory in decision.memories:
-#             if memory.is_new:
-#                 await store.aput(namespace, str(uuid.uuid4()), {'data': memory.text})
-
-
-#     return {'llm_used' : state.llm_used+1}
 
 
 async def ltm_write(state : AgriAdvisoryState , store : BaseStore) -> dict:
