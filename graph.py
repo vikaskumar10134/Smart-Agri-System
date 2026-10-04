@@ -3,6 +3,7 @@ from langchain_core.messages import SystemMessage , HumanMessage
 
 from langgraph.store.postgres import AsyncPostgresStore
 from langgraph.graph import StateGraph , START , END
+from contextlib import AsyncExitStack
 from langgraph.store.base import BaseStore
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -27,6 +28,11 @@ asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 from state import *
 from prompts import ADVISORY_PROMPT , INTENT_ROUTER_PROMPT , LTM_WRITE_PROMPT
 
+logger = logging.getLogger(__name__)
+
+# Module-level set holding strong references to in-flight background tasks
+# so they can't be garbage-collected or dropped when the event loop tears down.
+_background_tasks: set[asyncio.Task] = set()
 
 
 warnings.filterwarnings("ignore", category=UserWarning, module="langchain_nvidia_ai_endpoints")
@@ -132,10 +138,10 @@ async def intent_router_node(state : AgriAdvisoryState) -> dict:
 #     return {'llm_used' : state.llm_used+1}
 
 
-async def ltm_write(state : AgriAdvisoryState , store : BaseStore) -> dict:
+async def ltm_write(state: AgriAdvisoryState, store: BaseStore) -> dict:
 
     print('From the ltm write node')
-    
+        
     '''Extract atomic, de-duplicated facts from the turn and persist new ones.
 
     Args:
@@ -148,34 +154,56 @@ async def ltm_write(state : AgriAdvisoryState , store : BaseStore) -> dict:
         dict: Always an empty dict — this node mutates long-term memory
             directly via `store.aput` rather than the graph state.
     '''
-    
-    asyncio.create_task(_write_ltm_background(state, store))
+
+    task = asyncio.create_task(_write_ltm_background(state, store))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
     return {'llm_used': state.llm_used + 1}
 
+
 async def _write_ltm_background(state, store):
+
+    print('From the write ltm background')
+
+
     namespace = ('farmer_profile', state.farmer_id, 'profile')
     items = await store.asearch(namespace)
+    print(f'items : {items}')
     user_details_content = '\n'.join(f"-{it.value.get('data', '')}" for it in items) or "No memories on file yet."
 
-    ltm_write_llm = ChatNVIDIA(model="nvidia/nemotron-3.5-lightning-30b-a3b" , max_completion_tokens=8000)
+    ltm_write_llm = ChatNVIDIA(model="nvidia/nemotron-3.5-lightning-30b-a3b", max_completion_tokens=8000)
     ltm_write_structure_llm = ltm_write_llm.with_structured_output(MemoryDecision)
-    
+
     try:
         decision = await ltm_write_structure_llm.ainvoke([
             SystemMessage(content=LTM_WRITE_PROMPT.format(existing_memories=user_details_content)),
             HumanMessage(content=f"Query: {state.raw_query}\nResponse: {state.final_response}"),
         ])
 
-        # args = response.tool_calls[0]["args"]
-        # decision = MemoryDecision(**args)
-
+        print('\n\n\n\n')
+        print('='*80)
+        print(decision)
+        print('='*80)
 
         if decision.should_write:
             for memory in decision.memories:
                 if memory.is_new:
                     await store.aput(namespace, str(uuid.uuid4()), {'data': memory.text})
+                    print(f'\n\nMemory write :  {memory.text}\n\n')
+
     except Exception as e:
-        logger.warning(f"LTM write failed for farmer {state.farmer_id}: {e}")
+        print(f"LTM write failed for farmer {state.farmer_id}: {e}")
+
+
+async def shutdown_ltm_writer():
+
+    print('From the shutdown ltm write')
+
+    """Call this once, right before your process/script/request cycle ends,
+    so pending background writes get a chance to finish instead of being
+    cancelled when the event loop closes."""
+    if _background_tasks:
+        await asyncio.gather(*_background_tasks, return_exceptions=True)
 
 
 async def context_node(state : AgriAdvisoryState , store : BaseStore) -> dict:
@@ -210,18 +238,13 @@ async def context_node(state : AgriAdvisoryState , store : BaseStore) -> dict:
 
     return {'farmer_profile' : farmer_profile}
 
-def route_after_context(state : AgriAdvisoryState) -> Literal['weather_mcp_server' , 'mandi_mcp_server' , 'advisory_node']:
+def route_after_context(state : AgriAdvisoryState) -> Literal['weather_mcp_server' , 'advisory_node']:
 
-    if state.intent == 'crop_selection':
+    if state.intent in ('crop_selection', 'irrigation_timing', 'sell_or_hold_price'):
         return 'weather_mcp_server'
     
-    elif state.intent == 'irrigation_timing':
-        return 'weather_mcp_server'
     
-    elif state.intent == 'sell_or_hold_price':
-        return 'mandi_price_mcp_server'
-    
-    elif state.intent == 'pest_diagnosis':
+    else:
         return 'advisory_node'
 
     
@@ -282,7 +305,7 @@ async def weather_mcp_server(state : AgriAdvisoryState) -> dict:
 
 def route_after_weather(state : AgriAdvisoryState) -> Literal['mandi_price_mcp_server' , 'advisory_node']:
 
-    if state.intent == 'crop_selection':
+    if state.intent in ('crop_selection', 'sell_or_hold_price'):
         return 'mandi_price_mcp_server'
 
     if state.intent == 'irrigation_timing':
@@ -527,7 +550,8 @@ async def respond_node(state : AgriAdvisoryState , store : BaseStore) -> dict:
         'final_response' : final,
         'tool_used' : tool_used,
     }
-    
+
+
 
 builder.add_node('intent_router_node' , intent_router_node)
 builder.add_node('ltm_write' , ltm_write)
@@ -548,7 +572,6 @@ builder.add_conditional_edges(
     route_after_context,
     {
         'weather_mcp_server' : 'weather_mcp_server',
-        'mandi_price_mcp_server' : 'mandi_price_mcp_server',
         'image_branch' : 'image_branch',
     }
 )
@@ -571,29 +594,39 @@ builder.add_edge('respond_node' , 'ltm_write')
 builder.add_edge('ltm_write' , END)
 
 
+
+async def build_resources(DB_URL: str , index : Optional[dict] = None):
+
+    if not index:
+        index={
+            "embed": NVIDIAEmbeddings(model="nvidia/llama-nemotron-embed-vl-1b-v2" , dimensions=1024),
+            "dims": 1024,
+        }
+
+    checkpointer = AsyncPostgresSaver.from_conn_string(DB_URL)
+    store = AsyncPostgresStore.from_conn_string(DB_URL , index= index)
+
+    stack = AsyncExitStack()
+    checkpointer = await stack.enter_async_context(checkpointer)
+    store = await stack.enter_async_context(store)
+
+    await checkpointer.setup()
+    await store.setup()
+    return checkpointer, store , stack
+
+
+def build_advisory_graph(checkpointer, store):
+    # your existing node wiring (intent_router_node, ltm_write, etc.)
+    return builder.compile(checkpointer=checkpointer, store=store)
+
+
 async def main():
-    async with (
 
-        AsyncPostgresSaver.from_conn_string(
-            DB_URL,
-        ) as checkpointer,
+    checkpointer, store , stack = await build_resources(DB_URL)
+    try:
+        graph = build_advisory_graph(checkpointer, store)
 
-        AsyncPostgresStore.from_conn_string(
-            DB_URL,
-            index={
-                "embed": NVIDIAEmbeddings(model="nvidia/llama-nemotron-embed-vl-1b-v2" , dimensions=1024),
-                "dims": 1024,
-            },
-        ) as store
-
-        
-
-    ):
-        await checkpointer.setup()
-        await store.setup()
-    
-        # compile() is sync — it just builds the graph, no I/O here
-        graph = builder.compile(checkpointer=checkpointer , store=store)
+        config = {'configurable' : {'thread_id' : uuid.uuid4()}}
 
         farmer_profile = FarmerProfile(
             location={
@@ -613,18 +646,23 @@ async def main():
             "farmer_id": "f1",
             'query_type' : 'text',
             "raw_query": (
-                "My Brinjal crop needs water. Based on the weather this week, when should I irrigate next? "
+                "The mandi price for Brinjal at Lalru APMC has been dropping this week — should I sell now or hold my stock a few more days? "
             ),
             "farmer_profile": farmer_profile,
             'detected_language' : 'English',
         }
 
-        result = await graph.ainvoke(initial_state)
+        result = await graph.ainvoke(initial_state , config = config)
 
         print('====================== FINAL RESULT ======================')
 
-        for key, value in result.items():
-            print(f"{key}: {value}\n")
+        print(result.get('mandi_prices'))
+        print('='*100)
+        print(result.get('final_response'))
+
+    finally:
+            await stack.aclose()
+            await shutdown_ltm_writer()
 
 if __name__ == '__main__':
     asyncio.run(main())
